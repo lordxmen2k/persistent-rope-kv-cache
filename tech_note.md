@@ -1,344 +1,341 @@
-# Persistent-Rope KV Cache: Position-Keyed Structural Sharing for LLM Inference
+# Lock-Free Concurrent Rope for Multi-Tenant KV Cache
 
 **Author:** Gerald Enrique Nelson Mc Kenzie
 **Date:** 2026-10-08
 **License:** Apache 2.0
 **Repository:** https://github.com/lordxmen2k/persistent-rope-kv-cache
-**Status:** Draft v0.1 — design proposal, no implementation yet
+**Status:** Draft v0.2 — design proposal, reframed toward lock-free Bw-tree-on-rope contribution
 
 ---
 
 ## Abstract
 
-We propose a position-keyed persistent rope (linked trie) as the index
-structure for KV cache in LLM inference serving. The rope unifies four
-mechanisms that current production systems handle separately: (1) O(1)
-eviction at any point via unlink, (2) cross-request sharing via shared
-sublist pointers, (3) beam search and parallel sampling branching via
-persistent structural sharing, and (4) tiered storage via node-type tags.
-The design is principled, the data structure is well-understood, and the
-implementation cost is bounded. Honest framing: the rope does not solve
-the quadratic cost of attention or the bandwidth bottleneck of decode;
-what it offers is a *cleaner abstraction* over what PagedAttention,
-SGLang, and Mooncake already do, with the specific wins of structural
-sharing for branches and free O(1) eviction semantics.
+We propose a **lock-free concurrent rope** as the index structure for KV
+cache in multi-tenant LLM inference serving. The design combines the
+Bw-tree's latch-free mapping-table indirection (Microsoft, SIGMOD'13)
+with a position-keyed persistent rope, yielding a tree index where
+all mutations are atomic via compare-and-swap and reads traverse
+without locks. **Honest framing:** the contribution is not a new data
+structure — radix trees, persistent vectors, and lock-free B-trees
+each exist. The contribution is the specific *combination* of Bw-tree
+indirection with a rope-indexed KV cache for multi-tenant serving, and
+the empirical demonstration that lock-free indexing is feasible on
+GPU-attached memory. Prior work (vLLM, SGLang, Mooncake) uses
+coarse-grained locking that becomes a contention bottleneck under high
+concurrency; this is the gap we target.
 
 ## 1. Problem statement
 
-KV cache for a single request on Llama-3-70B-class models occupies
+KV cache for a single Llama-3-70B-class request occupies roughly
+40 KB/token at bf16. At 128K context and batch 32, that is ≈160 GB
+per server — comparable to the model weights. Under multi-tenant
+serving (SaaS, agent platforms, code copilots), the cache pool is
+shared across N concurrent requests and is the dominant memory object.
 
-```
-mem = batch × seq_len × n_layers × 2 × n_kv_heads × head_dim × bytes
-    ≈ 40 KB/token  (at 4 KV heads, 80 layers, 128 head dim, bf16)
-```
+Two failure modes compound under multi-tenant load:
 
-At 128K context and batch 32, this is ≈160 GB — comparable to the model
-weights themselves. Five concrete failure modes follow.
+1. **Lock contention on the index.** vLLM uses a single global
+   allocator with a mutex; SGLang's radix tree uses a global lock for
+   mutations. At 100+ concurrent requests with frequent branching
+   (beam search, agent rollouts, parallel sampling), this is the
+   measured bottleneck.
+2. **Read-modify-write races on shared prefixes.** Two requests sharing
+   a prefix require either copy-on-write (current SGLang) or
+   fine-grained locks; both are slow. The Bw-tree's delta-update model
+   handles this with a single CAS per mutation.
 
-1. **Linear memory growth with context.** Long-context applications
-   (RAG over a code repo, million-token chat) blow past HBM capacity.
-2. **Memory fragmentation under mixed workloads.** Different requests
-   have different lengths; naive contiguous allocation wastes 60–80%
-   of the reserved memory (vLLM SOSP'23).
-3. **Memory-bandwidth bound at decode.** Each token reads the entire KV
-   cache from HBM. Decode is bandwidth-bound, not compute-bound, even
-   on H100.
-4. **Cross-request reuse is unsafe.** Sharing KV across tenants
-   introduces timing side channels (PROMPTPEEK, NDSS'25; EarlyBird;
-   InputSnatch) that can reconstruct another user's prompt from
-   observable TTFT.
-5. **Branching amplifies everything.** Beam search and parallel sampling
-   multiply the cache by the branching factor; copy-on-write on
-   divergence is the current mitigation and it is wasteful.
+The rope contribution targets (1)–(2) at the *index-structure* level.
+The other KV-cache problems (memory footprint, decode bandwidth,
+side channels) are orthogonal and addressed in other work.
 
-The rope targets (1)–(3) and (5) at the *index-structure* level. Side
-channels (4) are an orthogonal problem that requires capability-tagged
-pointers (see §6).
+## 2. Related work
 
-## 2. Related work (honest framing)
+### 2.1 KV cache index structures (production)
 
-| System | Index structure | Branch sharing | Eviction | Sharing across requests | Production |
-|---|---|---|---|---|---|
-| HuggingFace `DynamicCache` | flat tensor | none | none | none | yes |
-| vLLM PagedAttention | block table (flat array) | copy-on-write | free list | APC (unsafe) | yes |
-| SGLang | radix tree (trie on tokens) | copy-on-write | LRU/LFU | LPM scheduler | yes |
-| Mooncake Store | hash-keyed distributed store | copy-on-write | LRU | prefix-cache pool | yes |
-| H2O / SnapKV / Pyramid | n/a (eviction only) | n/a | importance | n/a | research |
-| KIVI / KVQuant | n/a (quantization only) | n/a | mixed-precision | n/a | research |
-| Memorizing Transformer | ANN over external KV | n/a | FIFO | retrieval-based | research |
+- **PagedAttention (vLLM, SOSP'23).** Flat block table indexed by
+  block_id. O(1) ops, single global allocator with mutex. No tree
+  structure, no structural sharing.
+- **RadixAttention (SGLang, 2024).** Content-keyed radix tree. LRU
+  eviction over unlocked leaves, refcount on shared subtrees, split on
+  divergence. Production-deployed. Uses a global lock for mutations.
+  Recent extensions: Unified Radix Cache for hybrid attention
+  (FULL+SWA+MAMBA), HiCache for GPU/host/external tiers.
+- **Mooncake Store (Moonshot AI, 2024).** Hash-keyed distributed KV
+  pool. Chunked transfers, RDMA transfer engine. Not a tree.
+- **SGLang-LSM (arXiv:2511.16138, Nov 2025).** Layered LSM-tree
+  storage for KV cache, adaptive controller, key-value separation.
 
-**Where the rope fits.** It is closest to SGLang's radix tree in spirit
-(both index structures, both target prefix reuse), but differs in two
-key ways:
+### 2.2 Tree-based KV cache (research)
 
-- **Position-keyed, not content-keyed.** SGLang's radix tree indexes
-  blocks by token-content prefix hash. The rope indexes by sequence
-  position. This makes it better for ordered sequential access (the
-  common case during decode) and for branching (because forks happen at
-  a position, not at a content boundary).
-- **Persistent semantics.** A fork creates a new root pointer that
-  shares unchanged subtrees. Old beams remain valid without
-  copy-on-write. This is Clojure-style persistent vectors, applied to
-  KV cache.
+- **Trie-based beam search (arXiv:2502.00085, Feb 2025).** Trie over
+  beams, shared KV across branches with structural sharing. Closest
+  prior work to the rope's branching semantics. Uses CPU-side tree
+  state with KV-cache references.
+- **ArborKV (arXiv:2605.22106, 2025).** Tree-of-thoughts structure-
+  aware KV management. Tree topology drives budget allocation,
+  ancestor-chain prioritized.
+- **PEEK (arXiv:2607.02525, 2025).** Incremental radix tree over the
+  pending request queue, cluster-aware admission and eviction.
+- **RKSC (arXiv:2606.09937, 2025).** Reasoning-aware KV sharing with
+  `repeat_interleave` zero-copy broadcast across B branches.
+- **dotLLM (in development).** Roadmap explicitly plans trie-based
+  prefix sharing with reference counting and COW for beam branching —
+  essentially the persistent-rope design as a planned feature.
 
-**What the rope does not do.**
+### 2.3 Lock-free tree structures (CS foundations)
 
-- It does not compress KV. Quantization (KIVI/KVQuant), pruning (H2O),
-  or eviction (SnapKV) are orthogonal and compose with the rope.
-- It does not eliminate the quadratic attention cost. FlashAttention
-  is still required.
-- It does not address the bandwidth bottleneck of decode. Mixed-tier
-  storage (HBM/DRAM/SSD) helps; the rope is the index over those tiers.
+- **Bw-tree (Microsoft, SIGMOD'13).** Latch-free B-tree via
+  mapping-table indirection and delta updates. Production-deployed in
+  Hekaton and Azure SQL. The reference design for what we propose.
+- **Bε-tree (SIGMOD'15).** Bw-tree variant optimized for flash/SSD
+  with write-optimized layout.
+- **NV-tree (NSDI'15).** Persistent-memory-optimized Bw-tree variant.
+- **Masstree (NSDI'12).** Concurrent trie with lock-free internals
+  but different (per-node lock, not mapping-table indirection).
 
-## 3. Design: the persistent rope
+### 2.4 Persistent data structures (FP foundations)
 
-### 3.1 Structure
+- **Clojure persistent vector (Bagwell, 2001).** 32-way branching tree
+  with structural sharing. The "rope" we mean.
+- **Haskell Data.Sequence.** Finger tree, different access pattern.
+- **Okasaki, "Purely Functional Data Structures" (1998).** The
+  textbook.
 
-A balanced binary tree of list segments, where each leaf holds up to
-`B` tokens (default `B = 16`, same as PagedAttention). The leaf count
-is `O(L / B)`. The depth is `O(log(L / B))`.
+### 2.5 Side-channel defenses (orthogonal)
 
-```
-                        [root: 0..L)
-                       /          \
-                [left: 0..L/2)   [right: L/2..L)
-                  /     \           /      \
-              [a] [b] [c] [d]   [e] [f] [g] [h]   <- leaves
-               │   │   │   │     │   │   │   │
-              K/V K/V K/V K/V   K/V K/V K/V K/V
-```
+- **PrefixWall (arXiv:2603.10726, 2025).** Defends hash-keyed prefix
+  cache via principal-bound metadata.
+- **HMACK (arXiv:2608.09225, 2025).** Cryptographic separation of
+  cache keys by principal. The position-keyed analogue would use
+  capability metadata on the rope's leaves.
 
-Each leaf node contains:
+## 3. Design: lock-free rope via Bw-tree-style mapping table
 
-```
-struct LeafNode {
-    LeafNode* left_sibling;   // doubly-linked list at the leaf level
-    LeafNode* right_sibling;
-    RopeNode* parent;         // up to the root
-    uint32_t  start;          // absolute sequence position
-    uint32_t  end;            // exclusive
-    KVBlock   kv;             // K/V tensors for [start, end)
-    Tier      tier;           // HOT | WARM | COLD
-    uint32_t  refcount;       // for safe shared-subtree lifetime
-};
-```
+### 3.1 The rope
 
-The internal `RopeNode` carries only `start`, `end`, `left`, `right`,
-`refcount`, and `tier`. K/V lives only at the leaves.
+A position-keyed balanced binary tree of list segments. Each leaf
+holds up to `B` tokens (default `B = 16`). Leaf count is `O(L / B)`;
+depth is `O(log(L / B))`. Operations: `append`, `unlink`, `fork`,
+`share_prefix`, `evict`. All `O(log L)`. The rope is well-described in
+prior art (Bagwell, Clojure); we do not claim novelty on the data
+structure itself.
 
-### 3.2 Operations
+### 3.2 The Bw-tree indirection
 
-- **`append(seq, kv_block)`** — extend the rightmost leaf; if full,
-  split it. O(log L).
-- **`unlink(seq, n)`** — drop the leftmost n tokens; if a leaf becomes
-  empty, refcount-decrement and free. O(log L) amortized.
-- **`fork(seq)`** — return a new root pointer; share all unchanged
-  subtrees; copy only the rightmost divergent leaf. O(log L).
-- **`share_prefix(seq_a, seq_b, n)`** — point `seq_b`'s prefix subtree
-  to `seq_a`'s; refcount++. O(log L).
-- **`evict(seq, n)`** — like unlink, but the evicted nodes are spilled
-  to a colder tier (WARM or COLD) rather than freed. The leaf's `tier`
-  tag is updated.
+Following the Bw-tree, every rope node has:
 
-All operations are O(log L), with `L` being the sequence length. This
-is strictly worse than PagedAttention's O(1) block-table operations,
-but the gap is small in practice (a 128K sequence has ≈13 levels).
+- A **logical NodeID** (a 64-bit integer, never reused).
+- A **mapping table** entry: `NodeID → PhysicalAddress` resolved via
+  an atomic pointer (CAS-updatable).
+- A **base node** at the physical address.
+- A list of **delta records** (small updates: split, new child,
+  refcount change, tier promotion) attached via an atomic pointer from
+  the base node.
 
-### 3.3 Why a rope and not a doubly-linked list
+A read traverses: `NodeID → mapping table → base+delta → state`. A
+mutation writes a new delta record and CAS-updates the delta list
+pointer; this is the only synchronization point. Reads do not block
+mutations and vice versa.
 
-A doubly-linked list of pages is simpler and gives O(1) tail append /
-head unlink. But:
+A periodic **consolidation** merges the delta chain into a new base
+node and atomically updates the mapping table; old base + old deltas
+are garbage-collected when no in-flight read references them (via
+epoch-based reclamation or hazard pointers).
 
-- **Random access is O(n).** The rope gives O(log n) at the cost of one
-  extra level of indirection. For sparse attention patterns this
-  matters.
-- **Branching requires O(n) copy.** A rope fork shares the entire
-  unchanged prefix in O(log n).
-- **Tiered storage needs to address arbitrary positions.** A list
-  walk is fine for sequential access; a rope is fine for both.
+### 3.3 What this buys for KV cache
 
-For workloads that are purely sequential (e.g. single-stream decode),
-the linked list is strictly better. The rope pays its complexity cost
-only when branching or sparse access shows up.
+- **No global lock.** Every mutation is a single CAS on a per-node
+  atomic. Reads traverse without locks. Throughput scales with cores
+  in proportion to CAS contention, not in proportion to a single mutex
+  holder.
+- **Structural sharing is free.** `fork(seq)` allocates a new root
+  NodeID and a new delta record pointing into the existing tree;
+  unchanged subtrees are referenced by NodeID, not copied.
+- **Reference counting for shared subtrees.** Each internal node
+  carries an atomic refcount; `share_prefix(a, b, n)` increments
+  refcount on the shared subtree via a single CAS.
+- **No copy-on-write races.** Because all mutations are CAS-based, two
+  concurrent forks diverge at the divergence point without race; the
+  pre-divergence subtree is referenced by both, no copy needed.
+- **Crash recovery via mapping-table snapshot.** The mapping table is
+  small (NodeID → pointer). A periodic snapshot to disk is the WAL;
+  recovery is "replay mapping table + reconstruct rope from K/V blocks
+  on disk."
 
-### 3.4 Tiered storage via node tags
+### 3.4 GPU integration
 
-Each leaf carries a `tier` tag: `HOT` (HBM), `WARM` (CPU DRAM), `COLD`
-(NVMe SSD). On read, the rope traversal hits the right tier
-transparently. On eviction from `HOT` to `WARM`, the leaf's K/V is
-copied to DRAM and the HBM block is released; the leaf's `tier` tag
-flips. A periodic daemon promotes `WARM` → `HOT` for hot leaves and
-demotes `HOT` → `WARM` based on access frequency (LRU-2).
+The rope lives on the CPU side. K/V tensors live in HBM as a flat
+paged pool. At scheduling time, the rope is walked and a **snapshot
+array** of `(physical_block_id, byte_offset, length)` pairs is built
+for each active sequence. The GPU attention kernel consumes the
+snapshot array and issues coalesced loads. This is the same pattern
+vLLM and SGLang use today; the rope replaces the flat block table
+with a tree-indexed one.
 
-This is the design Mooncake ships, but with a rope-indexed tier
-boundary rather than a hash-keyed one. The advantage: position-based
-eviction is sequential and predictable, and prefetching is straightforward
-(read the next N leaves in order).
+The snapshot is a CPU-side object. Building it is `O(L/B)` per
+sequence; for a 128K sequence at B=16, that's 8K entries — small
+enough to rebuild per scheduling cycle.
 
-### 3.5 Side-channel defense
+### 3.5 Tiered storage
 
-The rope *enables* a capability-tagged variant. Each leaf carries a
-`principal_id` and `permissions` field. A cross-tenant access requires
-a capability minted by the principal, which is not derivable from the
-rope pointer alone. This is the CHERI (Univ. Cambridge ISCA'14+)
-insight applied to KV cache.
+Each leaf carries a `tier` tag (`HOT | WARM | COLD`). The leaf's K/V
+tensor pointer carries the tier semantics. A demotion (HOT → WARM)
+copies the K/V to DRAM, updates the leaf's pointer via CAS, releases
+the HBM block. The rope traversal is tier-agnostic; the snapshot
+array simply resolves to the right tier's address.
 
-Implementation: at the rope level, `share_prefix` requires explicit
-capability handoff; refcount is incremented only after capability
-check. The closest existing work is PrefixWall (arXiv:2603.10726) and
-HMACK (arXiv:2608.09225), both of which defend the *hash-keyed*
-prefix cache. The capability-tagged rope is the position-keyed
-analogue and has not been published to our knowledge.
+### 3.6 Capability-tagged variant (future work)
 
-## 4. Implementation sketch
+For multi-tenant safety, each leaf carries a `principal_id` and
+`permissions` bitmask. Cross-principal `share_prefix` requires a
+capability handoff and is checked at CAS time. This is the
+position-keyed analogue of PrefixWall/HMACK. We do not include this
+in the v1 design; it composes orthogonally.
 
-A reference implementation in pure Python (no GPU) targets correctness
-and benchmarking. A production implementation in Rust or C++ with
-CUDA kernels targets performance.
+## 4. Implementation plan
 
-### 4.1 Python reference (correctness target)
+### 4.1 Phase 1: correctness reference (Python, single-threaded)
 
-```python
-class RopeNode:
-    __slots__ = ("start", "end", "left", "right", "refcount", "tier", "parent")
+- Implement the rope in pure Python with Bw-tree-style mapping table.
+- Single-threaded for correctness; threading hooks stubbed.
+- Test against (a) sequential access, (b) branching, (c) prefix
+  sharing, (d) eviction, (e) tier transitions.
+- This is the deliverable that proves the design works.
 
-class LeafNode(RopeNode):
-    __slots__ = ("left_sibling", "right_sibling", "kv", "principal_id", "perms")
+### 4.2 Phase 2: concurrent correctness (Rust, multi-threaded)
 
-class PersistentRope:
-    def __init__(self, block_size: int = 16):
-        self.block_size = block_size
-        self.root: RopeNode | None = None
+- Port to Rust with `crossbeam-epoch` for epoch-based reclamation.
+- Atomic refcounts on internal nodes.
+- Test with TSan/loom for race conditions.
+- Benchmark concurrent throughput vs. SGLang's locked radix tree on
+  the same workload.
 
-    def append(self, kv: torch.Tensor, tier: Tier = Tier.HOT) -> RopeNode:
-        ...
+### 4.3 Phase 3: GPU integration (vLLM fork)
 
-    def fork(self) -> "PersistentRope":
-        # structural sharing: new root, same left subtree
-        ...
+- Add the rope as a drop-in replacement for vLLM's block table.
+- Wire the snapshot mechanism into the scheduler.
+- Run NIAH, LongBench, multi-tenant throughput benchmarks.
+- Compare against stock vLLM and SGLang.
 
-    def unlink(self, n: int) -> None:
-        ...
-```
+### 4.4 Phase 4: tiered storage + capabilities
 
-### 4.2 Production implementation (perf target)
-
-The hot path is GPU attention. The rope lives on the CPU side as an
-index; the actual K/V tensors live in HBM. On attention, the GPU
-kernel receives a flat list of `(block_id, byte_offset)` pairs resolved
-from the rope at scheduling time, then issues coalesced loads. This is
-the same pattern vLLM uses today; the rope replaces vLLM's flat block
-table with a tree-structured one.
-
-Locking: per-leaf mutex for mutation, RCU-style for read-mostly
-access. Lock-free variants (Bw-tree, Bε-tree) are research-grade but
-not necessary for v1.
+- Add WARM/COLD tiers with RDMA transfer engine integration.
+- Add capability-tagged variants.
+- Side-channel benchmark vs. PrefixWall.
 
 ## 5. Evaluation plan
 
-Concrete benchmarks, in order of priority:
+Concrete benchmarks, ordered:
 
-1. **Long-context NIAH** at 4K, 16K, 64K, 256K context. Measure
-   retrieval accuracy vs. PagedAttention baseline.
-2. **LongBench** (16 subsets) at 4K, 16K, 32K context. Measure average
-   score vs. PagedAttention, SGLang, and the StreamingLLM / H2O /
-   SnapKV family of eviction baselines.
-3. **Beam search memory** — 4-beam × 8K context. Measure peak memory
-   of the rope (with structural sharing) vs. vLLM (with copy-on-write).
-   Hypothesis: 60–80% memory reduction on diverged beams.
-4. **Prefix-sharing throughput** — synthetic workload with 90% prefix
-   overlap. Measure tokens/sec and TTFT vs. vLLM APC.
-5. **Tiered storage** — HBM/DRAM/SSD tier mix. Measure effective
-   bandwidth vs. flat HBM and flat DRAM.
+1. **Concurrent throughput.** 256 simultaneous requests with
+   overlapping prefixes. Measure tokens/sec, lock-acquisition
+   latency, CAS retry rate for the rope vs. SGLang's locked radix tree
+   and vLLM's flat block table.
+2. **Beam search memory and time.** 4-beam × 8K context. Measure
+   peak memory (rope with structural sharing) and time-per-token
+   (rope with concurrent fork).
+3. **Crash recovery.** Kill the process at random points. Recover
+   from the last mapping-table snapshot + disk-resident K/V blocks.
+   Verify the recovered state matches the pre-crash state modulo
+   in-flight requests.
+4. **Side-channel resistance** (Phase 4 only). With capability
+   metadata, verify that cross-tenant cache accesses are detected and
+   rejected at CAS time.
 
-Implementation: start with the Python reference and validate against
-(1) and (2) on Llama-3-8B. If results hold, port to a vLLM fork and
-run (3) and (4) on a single H100.
+Targets:
+
+- ≥2× concurrent throughput vs. SGLang at 256 requests.
+- ≥60% memory reduction on diverged beams vs. vLLM's CoW.
+- Crash recovery in <5s for a 100 GB cache pool.
 
 ## 6. Limitations and honest framing
 
-- **GPU perf cost.** The rope adds a tree walk on every cache lookup.
-  PagedAttention is one level of indirection with a fixed stride; the
-  rope is `O(log L)` with variable stride. For very long contexts
-  (≥256K) this matters; for typical 8K–32K contexts it does not.
-- **Concurrency is harder than flat tables.** Tree rebalancing under
-  multi-tenant load is non-trivial. vLLM's flat block table has a
-  simple global allocator; the rope needs per-subtree locking.
-- **The rope is not a replacement for eviction or quantization.** It
-  composes with them, but it does not by itself reduce memory
-  pressure. H2O / SnapKV / KIVI still need to run on top.
-- **Side-channel defense is not free.** Capability-tagged pointers add
-  per-leaf metadata and require runtime checks. The throughput cost is
-  small but non-zero.
-- **Empirical honesty.** Until we run the benchmarks, all claims about
-  memory reduction and throughput are hypotheses, not results. The
-  repo will track measurements as they come in.
+- **The rope is not novel.** Persistent vectors are 25 years old;
+  radix trees for KV cache are 2 years old; trie-based beam search is
+  9 months old. The contribution is the Bw-tree indirection, not the
+  data structure.
+- **Lock-free is hard.** Bw-tree correctness depends on careful epoch
+  reclamation, hazard pointers, and atomic ordering. Bugs are
+  catastrophic (use-after-free, lost updates). Implementation cost
+  is real.
+- **The benefit shows up only at high concurrency.** Below 32
+  concurrent requests, a locked tree is fine. The paper's strongest
+  result needs the multi-tenant workload.
+- **Mapping table size.** For 10K concurrent requests, the mapping
+  table is bounded but non-trivial. Compaction is a real engineering
+  problem.
+- **The position-keyed vs. content-keyed distinction is minor.** Both
+  indexes support the same operations; the differences show up at
+  specific access patterns, not in asymptotic complexity.
 
-## 7. Open questions
+## 7. Open questions specific to the lock-free design
 
-1. **Optimal block size `B`.** vLLM defaults to 16. Real workload
-   sweeps suggest 32–64 for long-context; we should re-sweep for the
-   rope.
-2. **Lock-free concurrent rope.** Bw-tree (Microsoft, SIGMOD'13) is the
-   closest existing design; porting it to GPU-attached KV cache is
-   open.
-3. **Differentiable indexing.** The rope is currently content-blind.
-   Learned indexing (e.g., RMI — Recursive Model Indexes) over the
-   rope could give O(1) lookups with learned models replacing
-   internal nodes.
-4. **Mamba / SSM integration.** If part of the cache is replaced by
-   Mamba state, the rope's leaf type becomes heterogeneous. Clean
-   extension, but the interaction with structural sharing is
-   non-trivial.
-5. **Cross-machine rope.** Mooncake shards the KV pool across nodes.
-   Does the rope index become a distributed structure, or is the rope
-   per-node and the cross-node lookup is hash-keyed? Open.
+1. **Delta record format for rope nodes.** Bw-tree deltas are
+   per-B-tree-page. Rope deltas are per-rope-node; the format needs
+   design (split-delta, new-child-delta, refcount-delta, tier-delta).
+2. **Mapping table compaction.** When can NodeIDs be reclaimed?
+   Epoch-based reclamation requires waiting for all in-flight reads;
+   the working set of in-flight reads can be large.
+3. **GC strategy.** Old base nodes and obsolete deltas need
+   reclamation. Epoch-based is simpler; hazard pointers are faster
+   but harder to get right.
+4. **Snapshot cost.** For a 128K sequence, the snapshot is 8K
+   entries. Can the GPU consume the rope directly via a device-side
+   mapping table mirror, or must it always be CPU-resolved?
+5. **WAL design.** Mapping-table snapshot + K/V blocks on disk
+   gives crash recovery, but the snapshot frequency is a tunable.
+6. **Multi-thread vs. multi-process.** Bw-tree assumes shared
+   memory. KV cache serving often uses multiple processes for
+   isolation; this needs a different indirection layer.
 
 ## 8. References
 
 1. Kwon et al. "Efficient Memory Management for Large Language Model
    Serving with PagedAttention." SOSP 2023.
 2. Zheng et al. "SGLang: Efficient Execution of Structured Language
-   Model Programs." 2024.
-3. Qin et al. "Mooncake: A KVCache-centric Disaggregated Architecture
-   for LLM Serving." 2024.
-4. Zhang et al. "H2O: Heavy-Hitter Oracle for Efficient Generative
-   Inference of Large Language Models." NeurIPS 2023.
-5. Li et al. "SnapKV: LLM Knows What You are Looking for Before
-   Generation." ICML 2024.
-6. Yang et al. "PyramidKV: Dynamic KV Cache Compression based on
-   Pyramidal Information Funneling." 2024.
-7. Liu et al. "KIVI: A Tuning-Free Asymmetric 2bit Quantization for
-   KV Cache." ICML 2024.
-8. Xiao et al. "Efficient Streaming Language Models with Attention
-   Sinks." ICLR 2024.
-9. Hooper et al. "KVQuant: Towards 10 Million Context Length LLM
-   Inference with KV Cache Quantization." NeurIPS 2024.
-10. Wu et al. "Memorizing Transformers." ICLR 2022.
-11. Mohtashami & Jaggi. "Landmark Attention: Random-Access Infinite
-    Context Length for Transformers." NeurIPS 2023.
-12. Wu et al. "PROMPTPEEK: Prompt Leakage via KV-Cache Sharing in
+   Model Programs." arXiv:2312.07104, 2024.
+3. Qin et al. "Mooncake: A KVCache-centric Disaggregated
+   Architecture." 2024.
+4. Ji et al. "Efficient Beam Search for Large Language Models via
+   Trie-based Parallel Decoding." arXiv:2502.00085, Feb 2025.
+5. Wu et al. "ArborKV: Structure-Aware KV Cache Management for
+   Scaling Tree-based LLM Reasoning." 2025.
+6. Jin et al. "PEEK: Predictive Queue-Informed KV Cache Management
+   for LLM Serving." arXiv:2607.02525, 2025.
+7. Liu et al. "RKSC: Reasoning-Aware KV Cache Sharing and Confident
+   Early Exit." arXiv:2606.09937, 2025.
+8. Levandoski et al. "The Bw-Tree: A Latch-Free B-Tree for
+   Multicore Systems." Microsoft, SIGMOD 2013.
+9. Sears & Ramamohanarao. "Bε-Tree." SIGMOD 2015.
+10. Yang et al. "NV-Tree: Persistent Memory Bw-Tree." NSDI 2015.
+11. Mao et al. "CachePrune: Privacy-Aware and Fine-Grained KV Cache
+    Sharing." 2025.
+12. Gao et al. "SGLang-LSM: Layered Storage for KV Cache."
+    arXiv:2511.16138, 2025.
+13. Cheng et al. "PersistentKV: Page-Aware Decode Scheduling."
+    2025.
+14. Qiu et al. "PROMPTPEEK: Prompt Leakage via KV-Cache Sharing in
     Multi-Tenant LLM Serving." NDSS 2025.
-13. Song et al. "The Early Bird Catches the Leak: Unveiling Timing
-    Side Channels in LLM Serving Systems." 2024.
-14. Woodruff et al. "CHERI: A Hybrid Capability-System Architecture
+15. Song et al. "PrefixWall: Defending Multi-Tenant LLM Serving
+    against Prefix Cache Side Channels." arXiv:2603.10726, 2025.
+16. Bagwell. "Ideal Hash Trees." 2001.
+17. Okasaki. "Purely Functional Data Structures." Cambridge, 1998.
+18. Patel et al. "Splitwise: Efficient Generative LLM Inference
+    Using Phase Splitting." ISCA 2024.
+19. Hooper et al. "KVQuant: Towards 10 Million Context Length LLM
+    Inference with KV Cache Quantization." NeurIPS 2024.
+20. Liu et al. "KIVI: A Tuning-Free Asymmetric 2bit Quantization for
+    KV Cache." ICML 2024.
+21. Yang et al. "PyramidKV: Dynamic KV Cache Compression based on
+    Pyramidal Information Funneling." 2024.
+22. Wu et al. "Memorizing Transformers." ICLR 2022.
+23. Mohtashami & Jaggi. "Landmark Attention: Random-Access Infinite
+    Context Length for Transformers." NeurIPS 2023.
+24. Woodruff et al. "CHERI: A Hybrid Capability-System Architecture
     for Scalable Software Compartmentalization." ISCA 2014.
-15. Cheng et al. "Adaptive CHERI Compartmentalization for
-    Heterogeneous Systems." ISCA 2025.
-16. Kwon et al. "Disaggregated LLM Serving via Phase-Aware
-    Scheduling." DistServe, 2024.
-17. Patel et al. "Splitwise: Efficient Generative LLM Inference Using
-    Phase Splitting." ISCA 2024.
-18. Su et al. "RotateKV: Accurate and Robust 2-Bit KV Cache
-    Quantization." IJCAI 2025.
-19. He et al. "ZipCache: Accurate and Efficient KV Cache
-    Quantization." NeurIPS 2024.
-20. TopKV: Topology-Aware Data Movement for Disaggregated GPU
+25. TopKV: Topology-Aware Data Movement for Disaggregated GPU
     Inference. arXiv:2607.28633, 2025.
-21. Persistent rope data structure. Bagwell & Stucki, Clojure
-    implementation. 2008.
-22. Jamba team. "Jamba: A Hybrid Transformer-Mamba Language Model."
-    2024.
+26. dotLLM project roadmap. github.com/kkokosa/dotLLM/docs/ROADMAP.md.
 
 ---
 
