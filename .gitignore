@@ -1,0 +1,36 @@
+﻿# Secrets (the typo'd PAT file in this workspace + the correct-spelling variant)
+KV_Cahce_PAT.txt
+KV_Cache_PAT.txt
+*.pat
+*_PAT.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Project
+*.log
+*.tmp
+data/cache/
+checkpoints/
