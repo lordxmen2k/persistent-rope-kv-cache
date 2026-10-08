@@ -1,3 +1,5 @@
+﻿# Copyright 2026 Tico Internet LLC
+# SPDX-License-Identifier: Apache-2.0
 """vLLM-compatible block manager interface.
 
 This module exposes a RopeBlockManager class that mimics vLLM's BlockManager

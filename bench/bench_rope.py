@@ -1,3 +1,5 @@
+﻿# Copyright 2026 Tico Internet LLC
+# SPDX-License-Identifier: Apache-2.0
 """Microbenchmarks for PersistentRope.
 
 Run: python -m bench.bench_rope

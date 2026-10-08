@@ -1,3 +1,5 @@
+﻿# Copyright 2026 Tico Internet LLC
+# SPDX-License-Identifier: Apache-2.0
 """Lock-free concurrent rope for KV cache indexing.
 
 Position-keyed persistent data structure with Bw-tree-style mapping-table

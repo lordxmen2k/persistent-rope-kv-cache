@@ -1,3 +1,5 @@
+﻿# Copyright 2026 Tico Internet LLC
+# SPDX-License-Identifier: Apache-2.0
 """HuggingFace integration demo: use the rope as a logical KV cache tracker.
 
 This script loads a small HuggingFace model (default: distilgpt2) and runs

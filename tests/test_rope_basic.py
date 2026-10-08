@@ -1,3 +1,5 @@
+﻿# Copyright 2026 Tico Internet LLC
+# SPDX-License-Identifier: Apache-2.0
 """Comprehensive basic-operation tests for PersistentRope.
 
 Run: pytest tests/test_rope_basic.py -v

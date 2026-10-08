@@ -1,3 +1,5 @@
+﻿# Copyright 2026 Tico Internet LLC
+# SPDX-License-Identifier: Apache-2.0
 """Concurrent stress tests for PersistentRope.
 
 These exercise multi-threaded access patterns. Python's GIL limits true

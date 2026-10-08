@@ -1,3 +1,5 @@
+﻿# Copyright 2026 Tico Internet LLC
+# SPDX-License-Identifier: Apache-2.0
 """Property-based tests for PersistentRope using Hypothesis.
 
 These tests generate random sequences of operations and assert invariants.

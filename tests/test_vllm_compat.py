@@ -1,3 +1,5 @@
+﻿# Copyright 2026 Tico Internet LLC
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the vLLM-compatible block manager interface."""
 import sys
 sys.path.insert(0, "src")

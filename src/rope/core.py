@@ -1,3 +1,5 @@
+﻿# Copyright 2026 Tico Internet LLC
+# SPDX-License-Identifier: Apache-2.0
 """PersistentRope: the rope index.
 
 Implementation notes
@@ -454,7 +456,7 @@ class PersistentRope:
                     self._deferred_free.append(leaf.node_id)
                     return new_split_internal.node_id
                 # Rebuild path[-1] with right = new_split_internal.
-                # Crucially, path[-1].left is preserved — this is the
+                # Crucially, path[-1].left is preserved â€” this is the
                 # left subtree that the previous code was dropping.
                 cur = InternalNode(
                     self._alloc_id(), path[-1].start, leaf.end + 1,
@@ -930,7 +932,7 @@ class PersistentRope:
                 return node.node_id, n  # all skipped, no promote
             promote_len = min(n, length - skip)
             if skip == 0 and promote_len == length:
-                # Whole leaf promoted — just retier
+                # Whole leaf promoted â€” just retier
                 new_leaf = LeafNode(
                     self._alloc_id(), node.start, node.end,
                     node.kv_blob, target_tier, node.refcount,
