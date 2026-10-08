@@ -34,3 +34,13 @@ desktop.ini
 *.tmp
 data/cache/
 checkpoints/
+
+# Test/cache artifacts
+.hypothesis/
+.pytest_cache/
+**/__pycache__/
+*.pyc
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
