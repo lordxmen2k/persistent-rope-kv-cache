@@ -13,6 +13,7 @@ from .core import (
     EmptySequenceError,
     OutOfRangeError,
 )
+from .vllm_compat import RopeBlockManager, RopeBlock, vLLMCompatibleInterface
 
 __all__ = [
     "NodeID",
@@ -23,4 +24,7 @@ __all__ = [
     "RopeError",
     "EmptySequenceError",
     "OutOfRangeError",
+    "RopeBlockManager",
+    "RopeBlock",
+    "vLLMCompatibleInterface",
 ]
