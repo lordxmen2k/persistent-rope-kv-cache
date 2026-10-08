@@ -1,4 +1,4 @@
-﻿# Copyright 2026 Tico Internet LLC
+# Copyright 2026 Tico Internet LLC
 # SPDX-License-Identifier: Apache-2.0
 """PersistentRope: the rope index.
 
@@ -169,7 +169,9 @@ class PersistentRope:
         self._deferred_free: list[NodeID] = []
         # Mutation count for consolidation scheduling
         self._mutation_count = 0
-        self._root_lock = threading.Lock()  # protects _root_id only
+        # Single mutation lock: serializes all state-mutating operations.
+        # The Rust port replaces this with CAS on the mapping table.
+        self._mutation_lock = threading.Lock()
         self._root_id: Optional[NodeID] = None
 
     # ------------------------------------------------------------------
@@ -263,7 +265,7 @@ class PersistentRope:
             raise ValueError(
                 f"kv_blob length {len(kv_blob)} != n {n}; in this reference 1 byte = 1 token"
             )
-        with self._root_lock:
+        with self._mutation_lock:
             new_root = self.append_to(self._root_id, kv_blob, n)
             self._root_id = new_root
             return new_root
@@ -274,21 +276,21 @@ class PersistentRope:
         If n >= length, returns NULL_NODE (empty). Updates the rope's main root.
         Thread-safe via the root lock.
         """
-        with self._root_lock:
+        with self._mutation_lock:
             new_root = self.unlink_from(self._root_id, n)
             self._root_id = new_root
             return new_root
 
     def evict(self, n: int) -> NodeID:
         """Demote the leftmost n tokens to WARM tier. Returns new root."""
-        with self._root_lock:
+        with self._mutation_lock:
             new_root = self.evict_from(self._root_id, n)
             self._root_id = new_root
             return new_root
 
     def promote(self, n: int) -> NodeID:
         """Promote the rightmost n tokens to HOT tier. Returns new root."""
-        with self._root_lock:
+        with self._mutation_lock:
             new_root = self.promote_from(self._root_id, n)
             self._root_id = new_root
             return new_root
@@ -468,7 +470,7 @@ class PersistentRope:
                     # (as its left child), so it must NOT be deferred.
                     return new_split_internal.node_id
                 # Rebuild path[-1] with right = new_split_internal.
-                # Crucially, path[-1].left is preserved â€” this is the
+                # Crucially, path[-1].left is preserved — this is the
                 # left subtree that the previous code was dropping.
                 cur = InternalNode(
                     self._alloc_id(), path[-1].start, leaf.end + 1,
@@ -488,47 +490,6 @@ class PersistentRope:
                     cur = new_anc
                 return cur.node_id
 
-    def unlink(self, n: int) -> NodeID:
-        """Drop the leftmost `n` tokens from the main root. Returns new root NodeID.
-
-        If n >= length, returns NULL_NODE (empty). Updates the rope's main root.
-        For unlinking from a non-main root, use ``unlink_from``.
-        """
-        new_root = self.unlink_from(self._root_id, n)
-        self._root_id = new_root
-        return new_root
-
-    def unlink_from(self, root: Optional[NodeID], n: int) -> NodeID:
-        """Drop the leftmost `n` tokens from `root`. Returns new root NodeID."""
-        if n < 0:
-            raise ValueError("n must be >= 0")
-        if n == 0:
-            return root
-        if root is None or root == NULL_NODE:
-            raise EmptySequenceError("cannot unlink from empty sequence")
-        length = self._span(root)
-        if n >= length:
-            # Whole thing gone
-            self._drop_subtree(root)
-            return NULL_NODE
-        new_root = self._unlink_left(root, n)
-        # Renumber: every node's start/end is decremented by `n` so that
-        # user position 0 is again the leftmost token.
-        self._renumber(new_root, -n)
-        self._bump_mutation()
-        return new_root
-
-    def _renumber(self, nid: NodeID, delta: int) -> None:
-        """Walk the subtree rooted at nid and add `delta` to every start/end."""
-        n = self._get(nid)
-        if n is None:
-            return
-        n.start += delta
-        n.end += delta
-        if not isinstance(n, LeafNode):
-            self._renumber(n.left, delta)
-            self._renumber(n.right, delta)
-
     def length(self) -> int:
         """Length of the main root."""
         if self._root_id is None or self._root_id == NULL_NODE:
@@ -540,120 +501,6 @@ class PersistentRope:
         if root is None or root == NULL_NODE:
             return 0
         return self._span(root)
-
-    def fork(self, root: Optional[NodeID] = None) -> NodeID:
-        """Structural-sharing fork. Returns new root NodeID.
-
-        If root is None, forks the main root. The fork shares the entire
-        tree by NodeID; refcounts on shared subtrees are incremented. No
-        bytes are copied.
-        """
-        if root is None:
-            root = self._root_id
-        if root is None or root == NULL_NODE:
-            return NULL_NODE
-        self._bump_refcount_subtree(root)
-        self._bump_mutation()
-        return root
-
-    def share_prefix(self, a: Optional[NodeID], n: int) -> NodeID:
-        """Return a new root that structurally shares the first `n` tokens of `a`.
-
-        If n == a's full length, the new root is a fork of a (no copy).
-        If n < a's length, the new root is a forked prefix, truncated to n.
-        The original a is unchanged.
-        """
-        if a is None or a == NULL_NODE:
-            raise EmptySequenceError("a is empty")
-        if n < 0:
-            raise ValueError("n must be >= 0")
-        a_len = self._span(a)
-        if n > a_len:
-            raise OutOfRangeError(f"n={n} > a.length={a_len}")
-        if n == 0:
-            return a  # no-op: return the same root (caller can decide)
-        if n == a_len:
-            return self.fork(a)
-        # Partial: fork a, then truncate to n
-        forked = self.fork(a)
-        return self._truncate_right(forked, n)
-
-    def evict(self, n: int) -> NodeID:
-        """Demote the leftmost n tokens to WARM tier. Returns new root.
-
-        Updates the main root. For evicting a non-main root, use ``evict_from``.
-        """
-        new_root = self.evict_from(self._root_id, n)
-        self._root_id = new_root
-        return new_root
-
-    def evict_from(self, root: Optional[NodeID], n: int) -> NodeID:
-        """Demote the leftmost n tokens of `root` to WARM tier."""
-        if n < 0:
-            raise ValueError("n must be >= 0")
-        if n == 0 or root is None or root == NULL_NODE:
-            return root
-        length = self._span(root)
-        n = min(n, length)
-        new_root = self._demote_left(root, n, Tier.WARM)
-        self._bump_mutation()
-        return new_root
-
-    def promote(self, n: int) -> NodeID:
-        """Promote the rightmost n tokens to HOT tier. Returns new root."""
-        new_root = self.promote_from(self._root_id, n)
-        self._root_id = new_root
-        return new_root
-
-    def promote_from(self, root: Optional[NodeID], n: int) -> NodeID:
-        """Promote the rightmost n tokens of `root` to HOT tier."""
-        if n < 0:
-            raise ValueError("n must be >= 0")
-        if n == 0 or root is None or root == NULL_NODE:
-            return root
-        length = self._span(root)
-        n = min(n, length)
-        new_root = self._promote_right(root, n, Tier.HOT)
-        self._bump_mutation()
-        return new_root
-
-    # ------------------------------------------------------------------
-    # Public API: reads
-    # ------------------------------------------------------------------
-
-    def resolve(self, root: Optional[NodeID] = None) -> list[tuple[NodeID, int, int]]:
-        """Build a snapshot array of (node_id, byte_offset, length) for
-        the leaves in left-to-right order. This is what a GPU attention
-        kernel would consume. If root is None, uses the main root.
-        """
-        if root is None:
-            root = self._root_id
-        if root is None or root == NULL_NODE:
-            return []
-        out: list[tuple[NodeID, int, int]] = []
-        offset = 0
-        for leaf in self._iter_leaves(root):
-            out.append((leaf.node_id, offset, leaf.end - leaf.start))
-            offset += leaf.end - leaf.start
-        return out
-
-    def get_kv(self, pos: int, root: Optional[NodeID] = None) -> bytes:
-        """Return the single-token K/V blob at absolute position `pos`.
-
-        If root is None, uses the main root.
-        """
-        if root is None:
-            root = self._root_id
-        if root is None or root == NULL_NODE:
-            raise OutOfRangeError("empty sequence")
-        leaf = self._find_leaf(root, pos)
-        if leaf is None:
-            raise OutOfRangeError(f"pos {pos} out of range")
-        return leaf.kv_blob[pos - leaf.start : pos - leaf.start + 1]
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _span(self, nid: NodeID) -> int:
         n = self._get(nid)
@@ -798,7 +645,7 @@ class PersistentRope:
             # Drop entire left subtree, then drop from right
             self._deferred_free.append(node.left)
             new_right, n = self._unlink_left_rec(node.right, n - left_len)
-            # Drop the current node — the modified right subtree replaces it
+            # Drop the current node -- the modified right subtree replaces it
             self._deferred_free.append(node.node_id)
             if new_right is None or new_right == NULL_NODE:
                 return NULL_NODE, n
@@ -937,7 +784,7 @@ class PersistentRope:
                 return node.node_id, n  # all skipped, no promote
             promote_len = min(n, length - skip)
             if skip == 0 and promote_len == length:
-                # Whole leaf promoted â€” just retier
+                # Whole leaf promoted — just retier
                 new_leaf = LeafNode(
                     self._alloc_id(), node.start, node.end,
                     node.kv_blob, target_tier, node.refcount,
@@ -1166,7 +1013,7 @@ class PersistentRope:
         """
         n = self._get(nid)
         if n is None:
-            # dangling reference — corruption
+            # dangling reference � corruption
             return
         reachable_ref[0] += 1
         yield nid

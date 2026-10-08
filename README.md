@@ -18,16 +18,22 @@ under multi-tenant load.
 | Phase | File | Status |
 |---|---|---|
 | Design | `tech_note.md` (v0.2) | 26 references, reframed toward lock-free Bw-tree-on-rope |
-| Phase 1 | `src/rope/core.py` | PersistentRope: append, unlink, fork, share_prefix, evict, promote, resolve, get_kv |
+| Phase 1 | `src/rope/core.py` | PersistentRope: append, unlink, fork, share_prefix, evict, promote, resolve, get_kv, rebalance, consolidate |
 | Phase 1 | `tests/test_rope_basic.py` | 33 unit tests |
 | Phase 1 | `tests/test_rope_property.py` | 9 property tests (~1000 generated cases each) |
+| Phase 1 | `tests/test_rope_maintenance.py` | 16 rebalance/consolidate tests |
 | Phase 2 | `tests/test_rope_concurrent.py` | 9 multi-threaded stress tests |
 | Phase 3 | `src/rope/vllm_compat.py` | RopeBlockManager with vLLM-style API |
 | Phase 3 | `tests/test_vllm_compat.py` | 9 vLLM-API tests |
 | Phase 3 | `examples/hf_integration.py` | distilgpt2 + RopeBlockManager end-to-end demo |
-| Phase 1 | `bench/bench_rope.py` | microbenchmarks |
+| Bench | `bench/bench_rope.py` | microbenchmarks (single-op throughput) |
+| Bench | `bench/bench_prefix_sharing.py` | structural sharing (97% memory savings) |
+| Bench | `bench/stress_test.py` | multi-tenant concurrent stress |
+| Bench | `bench/bench_with_model.py` | distilgpt2 + rope (rope is 0.14% of model cost) |
+| Bench | `bench/REPORT.md` | honest performance report for the book |
+| Issues | `GITHUB_ISSUES.md` | 36 prioritized issues (P0–P3) |
 
-**Test summary:** 59 passed, 1 skipped (Unix-only), 79% coverage.
+**Test summary:** 75 passed, 1 skipped (Unix-only), 79% coverage.
 
 ## Quick start
 
@@ -40,8 +46,14 @@ pytest -v
 pip install -e ".[hf]"
 python -m examples.hf_integration --max-new-tokens 30
 
-# Run the microbenchmarks
+# Run the benchmarks
 python -m bench.bench_rope
+python -m bench.bench_prefix_sharing
+python -m bench.stress_test
+python -m bench.bench_with_model   # downloads distilgpt2
+
+# Or read the report
+cat bench/REPORT.md
 ```
 
 The HF demo loads `distilgpt2` (~80M params), runs generation, then
@@ -65,10 +77,15 @@ demonstrates beam-search-style branching and WARM-tier spill. Runs in
       tests/
         test_rope_basic.py                       unit tests (33)
         test_rope_property.py                    property tests (9)
+        test_rope_maintenance.py                 rebalance/consolidate tests (16)
         test_rope_concurrent.py                  concurrent stress tests (9)
         test_vllm_compat.py                      vLLM-API tests (9)
       bench/
-        bench_rope.py                            microbenchmarks
+        bench_rope.py                            microbenchmarks (single-op)
+        bench_prefix_sharing.py                  structural sharing analysis
+        stress_test.py                           multi-tenant concurrent stress
+        bench_with_model.py                      real-model (distilgpt2) integration
+        REPORT.md                                honest performance report
       examples/
         hf_integration.py                        distilgpt2 + rope end-to-end
       rust/                                      Rust port scaffold (lock-free)
@@ -90,9 +107,11 @@ demonstrates beam-search-style branching and WARM-tier spill. Runs in
   3. Routing the scheduler's `allocate` / `free` / `fork` / `swap_*` /
      `append_slot` calls to `RopeBlockManager`
 
-- **Balanced tree.** Sequential appends produce a right-skewed tree
-  (O(n) depth). The Rust port rebalances; the Python reference is
-  intentionally naive. Documented in the bench output.
+- **Rebalance across multiple live roots.** The current `rebalance()`
+  operates on the rope's main root and may drop internals that other
+  live roots still reference (filed as P0-11 in `GITHUB_ISSUES.md`).
+  The single-root rebalance in the bench is correct; the multi-root
+  case needs refcount-aware node reclamation.
 
 ## Open research questions (from tech_note §7)
 

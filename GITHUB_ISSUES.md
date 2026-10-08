@@ -329,6 +329,77 @@ Ch 7 §7.2, Ch 14 §14.2.
 
 ---
 
+## P0-11: `rebalance_to_root()` corrupts live multi-tenant roots
+
+**Priority:** P0
+**Labels:** `bug`, `python`, `correctness`
+**Estimated effort:** 3-5 days
+**Discovered:** 2026-10-08 while building the multi-tenant stress test (`bench/stress_test.py`)
+
+### Background
+
+`rebalance()` in `src/rope/core.py` operates on `self._root_id` and
+unconditionally drops the old internals via `_drop_internals()` into the
+deferred-free list, then calls `collect_garbage()` which deletes them
+from the mapping table. When the rope has multiple live roots (e.g.
+32 sequences built by `append_to` from a common prefix), the prefix's
+internals are **shared** between the live roots. Dropping them
+unconditionally breaks the other live roots — `r.length_of(other_root)`
+returns 0 after rebalance because the shared internals are gone.
+
+Concrete reproduction:
+
+```python
+r = PersistentRope(block_size=16)
+r.append(b"P" * 200)
+common = r.root_id()
+roots = [r.append_to(common, bytes([i % 26 + ord('a')]) * 30) for i in range(32)]
+# roots[0] is a 230-token rope (200 shared + 30 suffix)
+r.append_to(roots[0], b"a" * 5000)  # grow it
+assert r.length_of(roots[0]) == 5230
+r.rebalance_to_root()  # operates on _root_id, which is still the original 200-token common
+assert r.length_of(roots[0]) == 0  # BROKEN: shared internals were dropped
+```
+
+### What needs to be done
+
+1. **Make `rebalance(root)` rebalance a specific root**, not just
+   `self._root_id`. The new signature returns a new root without
+   touching `_root_id`.
+
+2. **In `rebalance()`, only drop internals whose refcount == 1.** A
+   shared internal (refcount > 1) is still in use by another live root
+   and must not be freed. The current `_drop_internals()` ignores
+   refcount.
+
+3. **Audit `append_to` and `unlink_from` to bump refcount on shared
+   subtrees.** When a new root is created that aliases the old root's
+   subtree (the new root "keeps" the prefix), the prefix subtree's
+   refcount must be incremented. This is the structural-sharing
+   invariant that `fork()` already honors but `append_to` and
+   `unlink_from` do not.
+
+4. **Add a regression test** in `tests/test_rope_basic.py` that builds
+   N roots from a common prefix, calls `rebalance()` on one of them,
+   and asserts that the other N-1 roots are still readable.
+
+### Acceptance criteria
+
+- `r.rebalance(some_root)` rebalances that specific root and returns a
+  new NodeID, leaving the other live roots intact.
+- `r.length_of(other_root)` returns the original value after
+  rebalancing any other root.
+- A new test `test_rebalance_preserves_multi_tenant_roots` passes.
+- The `bench/stress_test.py` runs without the multi-root rebalance
+  workaround (currently it tests rebalance on a fresh single-root rope
+  to avoid the bug).
+
+### Book reference
+
+Ch 7 §7.4, Ch 15 §15.3 (multi-tenant design).
+
+---
+
 ## P1-11: GPU attention kernel that consumes the rope's snapshot
 
 **Priority:** P1

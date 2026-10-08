@@ -43,12 +43,26 @@ def main():
     r = PersistentRope(block_size=16)
     r.append(b"x" * 10_000)
 
-    bench("length() x 10000", 10_000, lambda: r, lambda r: r.length())
-    bench("get_kv(0) x 10000", 10_000, lambda: r, lambda r: r.get_kv(0))
-    bench("get_kv(5000) x 10000", 10_000, lambda: r, lambda r: r.get_kv(5000))
-    bench("get_kv(9999) x 10000", 10_000, lambda: r, lambda r: r.get_kv(9999))
-    bench("resolve() x 1000", 1_000, lambda: r, lambda r: r.resolve())
-    bench("fork() x 1000", 1_000, lambda: r, lambda r: r.fork())
+    # Reads on a right-skewed tree are O(depth). Sequential appends produce
+    # one leaf per 16 tokens, so this is a ~625-leaf / 625-internal tree
+    # with depth proportional to n_leaves. get_kv near the head (0) is fast
+    # because the head path is short; mid/late positions walk the spine.
+    r_skewed = r
+    bench("length() x 10000", 10_000, lambda: r_skewed, lambda r: r.length())
+    bench("get_kv(0) x 10000 [skewed]", 10_000, lambda: r_skewed, lambda r: r.get_kv(0))
+    bench("get_kv(5000) x 10000 [skewed]", 10_000, lambda: r_skewed, lambda r: r.get_kv(5000))
+    bench("get_kv(9999) x 10000 [skewed]", 10_000, lambda: r_skewed, lambda r: r.get_kv(9999))
+    bench("resolve() x 1000 [skewed]", 1_000, lambda: r_skewed, lambda r: r.resolve())
+    bench("fork() x 1000 [skewed]", 1_000, lambda: r_skewed, lambda r: r.fork())
+
+    # Same data, rebalanced. After rebalance, depth is O(log n_leaves).
+    r_bal = PersistentRope(block_size=16)
+    r_bal.append(b"x" * 10_000)
+    r_bal.rebalance_to_root()
+    bench("get_kv(0) x 10000 [balanced]", 10_000, lambda: r_bal, lambda r: r.get_kv(0))
+    bench("get_kv(5000) x 10000 [balanced]", 10_000, lambda: r_bal, lambda r: r.get_kv(5000))
+    bench("get_kv(9999) x 10000 [balanced]", 10_000, lambda: r_bal, lambda r: r.get_kv(9999))
+    bench("resolve() x 1000 [balanced]", 1_000, lambda: r_bal, lambda r: r.resolve())
 
     # Unlink throughput (re-seed per op)
     def setup_unlink_small():
@@ -72,12 +86,13 @@ def main():
     r3.append(b"x" * 10_000)
     r3.collect_garbage()
     print()
-    print("Final state stats (post-GC):")
+    print("Final state stats (post-GC, sequential 10K-token rope):")
     for k, v in r3.stats().items():
         print(f"  {k}: {v}")
     print()
-    print("Note: sequential appends produce a right-skewed tree (O(n) depth).")
-    print("The Rust port rebalances; the Python reference is intentionally naive.")
+    print("Note: sequential appends create one leaf per 16 tokens (block_size).")
+    print("Tree depth is O(n_leaves); rebalance() makes it O(log n_leaves).")
+    print("See the [skewed] vs [balanced] rows above for the impact on get_kv.")
 
 
 if __name__ == "__main__":

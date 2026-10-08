@@ -44,3 +44,6 @@ checkpoints/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+
+# Bench scratch (raw captured stdout, not deliverables)
+bench/_last_*.txt
