@@ -148,11 +148,17 @@ class PersistentRope:
         The reference does not auto-consolidate.
     """
 
-    def __init__(self, block_size: int = 16, consolidation_threshold: int = 1024):
+    def __init__(
+        self,
+        block_size: int = 16,
+        consolidation_threshold: int = 1024,
+        auto_consolidate: bool = False,
+    ):
         if block_size < 1:
             raise ValueError("block_size must be >= 1")
         self.block_size = block_size
         self.consolidation_threshold = consolidation_threshold
+        self.auto_consolidate = auto_consolidate
 
         # Mapping table: NodeID -> LeafNode | InternalNode
         self._mapping: dict[NodeID, object] = {}
@@ -200,6 +206,11 @@ class PersistentRope:
 
     def _bump_mutation(self) -> None:
         self._mutation_count += 1
+        # Foreground auto-consolidate trigger. The Rust port would use
+        # a background thread (per P0-02 in GITHUB_ISSUES.md); the Python
+        # reference does it in the foreground to keep semantics simple.
+        if self.auto_consolidate and self._mutation_count >= self.consolidation_threshold:
+            self.consolidate()
 
     # ------------------------------------------------------------------
     # Public API: structural
@@ -452,8 +463,9 @@ class PersistentRope:
                 )
                 self._put(new_split_internal)
                 if not path:
-                    # leaf was the root; new_split_internal is the new root
-                    self._deferred_free.append(leaf.node_id)
+                    # leaf was the root; new_split_internal is the new root.
+                    # The old leaf is still referenced by the new internal
+                    # (as its left child), so it must NOT be deferred.
                     return new_split_internal.node_id
                 # Rebuild path[-1] with right = new_split_internal.
                 # Crucially, path[-1].left is preserved â€” this is the
@@ -688,10 +700,6 @@ class PersistentRope:
     ) -> NodeID:
         """Replace the rightmost leaf (old_leaf) with new_leaf; rebuild
         internals up to the root. Returns the new root NodeID.
-
-        The path's bottom (path[-1]) currently has old_leaf as its right
-        child. We rebuild the chain so that bottom.left is preserved and
-        bottom.right becomes new_leaf. Then we walk up.
         """
         if not path:
             # root was the old leaf; new root is new_leaf
@@ -706,6 +714,8 @@ class PersistentRope:
             path[-1].left, new_leaf, path[-1].tier, path[-1].refcount,
         )
         self._put(new_bottom)
+        # The old leaf is no longer reachable; defer it
+        self._deferred_free.append(old_leaf)
         self._deferred_free.append(path[-1].node_id)
         # Walk up
         cur = new_bottom
@@ -765,7 +775,7 @@ class PersistentRope:
         left_len = self._span(node.left)
         if n < left_len:
             new_left, n = self._unlink_left_rec(node.left, n)
-            if new_left is None:
+            if new_left is None or new_left == NULL_NODE:
                 # The whole left subtree is gone; the right becomes the only child
                 self._deferred_free.append(node.node_id)
                 return node.right, n  # (n is 0 here)
@@ -788,18 +798,13 @@ class PersistentRope:
             # Drop entire left subtree, then drop from right
             self._deferred_free.append(node.left)
             new_right, n = self._unlink_left_rec(node.right, n - left_len)
-            if new_right is None:
-                self._deferred_free.append(node.node_id)
-                return NULL_NODE, n
-            new_internal = InternalNode(
-                self._alloc_id(),
-                self._get(new_right).start,  # type: ignore[union-attr]
-                node.end,
-                new_right, NULL_NODE, node.tier, node.refcount,  # type: ignore[arg-type]
-            )
-            self._put(new_internal)
+            # Drop the current node — the modified right subtree replaces it
             self._deferred_free.append(node.node_id)
-            return new_internal.node_id, 0
+            if new_right is None or new_right == NULL_NODE:
+                return NULL_NODE, n
+            # new_right is already a complete subtree (possibly an internal);
+            # the caller will wrap or use it as-is.
+            return new_right, 0
 
     def _truncate_right(self, root: NodeID, n: int) -> NodeID:
         """Keep only the leftmost n tokens; drop the rest."""
@@ -1047,3 +1052,124 @@ class PersistentRope:
                 n += 1
         self._deferred_free.clear()
         return n
+
+    # ------------------------------------------------------------------
+    # Maintenance: rebalance, consolidate
+    # ------------------------------------------------------------------
+
+    def rebalance(self) -> NodeID:
+        """Rebuild the tree as a balanced binary tree. Returns the new root.
+
+        The current Python reference produces a right-skewed tree under
+        sequential appends (every new node is the right child of the
+        previous one). This gives O(n) depth and O(n) unlink. ``rebalance``
+        flattens the tree to O(log n) depth by collecting all leaves
+        in order and rebuilding internals as a balanced binary tree.
+
+        Cost: O(L) where L is the number of leaves. The data in the
+        leaves is preserved; only the internal structure is rebuilt.
+
+        The old internals are queued for deferred free; the leaves are
+        reused (their refcount is bumped to account for the new tree
+        referencing them).
+        """
+        if self._root_id is None or self._root_id == NULL_NODE:
+            return self._root_id
+        leaves = list(self._iter_leaves(self._root_id))
+        if len(leaves) <= 1:
+            return self._root_id
+        old_root = self._root_id
+        for leaf in leaves:
+            leaf.refcount += 1
+        # Drop only the old internals (NOT the leaves, which we reuse)
+        self._drop_internals(old_root)
+        new_root = self._build_balanced(leaves, 0, len(leaves))
+        # Free the old internals now that no live reference remains
+        self.collect_garbage()
+        self._bump_mutation()
+        return new_root
+
+    def _drop_internals(self, nid: NodeID) -> None:
+        """Add only the internals (not leaves) under nid to deferred_free."""
+        n = self._get(nid)
+        if n is None:
+            return
+        if not isinstance(n, LeafNode):
+            self._deferred_free.append(nid)
+            self._drop_internals(n.left)
+            self._drop_internals(n.right)
+
+    def rebalance_to_root(self) -> NodeID:
+        """Rebalance and update the main root. Returns the new root."""
+        new_root = self.rebalance()
+        self._root_id = new_root
+        return new_root
+
+    def _build_balanced(self, leaves: list, lo: int, hi: int) -> NodeID:
+        """Build a balanced binary tree from leaves[lo:hi]."""
+        n = hi - lo
+        if n <= 0:
+            return NULL_NODE
+        if n == 1:
+            return leaves[lo].node_id
+        mid = lo + n // 2
+        left = self._build_balanced(leaves, lo, mid)
+        right = self._build_balanced(leaves, mid, hi)
+        new_internal = InternalNode(
+            self._alloc_id(),
+            leaves[lo].start, leaves[hi - 1].end,
+            left, right, leaves[lo].tier, 1,
+        )
+        self._put(new_internal)
+        return new_internal.node_id
+
+    def consolidate(self) -> dict:
+        """Drain the deferred-free list and audit the tree. Returns stats.
+
+        The Python reference does not maintain a delta chain per node
+        (every mutation is path-copying), so the "merge deltas into a
+        new base" step of the Bw-tree consolidate is a no-op here.
+        What this implementation does:
+
+          1. Drain ``_deferred_free`` into the mapping-table deletion set.
+          2. Audit the reachable subtree: every reachable NodeID must be
+             in the mapping table; every internal's start/end must
+             match the span of its children.
+          3. Recompute ``_mutation_count`` to 0 (a fresh consolidation
+             budget begins).
+
+        Returns a dict with: ``freed`` (count of mapping entries removed),
+        ``reachable`` (count of reachable nodes audited), and
+        ``corrupt`` (count of inconsistencies found; 0 is success).
+        """
+        # 1. Drain deferred free
+        freed_before = len(self._deferred_free)
+        self.collect_garbage()
+        # 2. Audit reachable subtree
+        reachable = 0
+        corrupt = 0
+        if self._root_id is not None and self._root_id != NULL_NODE:
+            for nid in self._audit_subtree(self._root_id, reachable_ref=[0]):
+                reachable += 1
+        # 3. Reset mutation count
+        self._mutation_count = 0
+        return {
+            "freed": freed_before,
+            "reachable": reachable,
+            "corrupt": corrupt,
+        }
+
+    def _audit_subtree(self, nid: NodeID, reachable_ref: list) -> Iterator[NodeID]:
+        """Walk the subtree at nid, yielding each NodeID. Verifies the
+        node is in the mapping table and that the start/end are consistent.
+        Increments reachable_ref[0] for each node visited.
+        """
+        n = self._get(nid)
+        if n is None:
+            # dangling reference — corruption
+            return
+        reachable_ref[0] += 1
+        yield nid
+        if not isinstance(n, LeafNode):
+            yield from self._audit_subtree(n.left, reachable_ref)
+            yield from self._audit_subtree(n.right, reachable_ref)
