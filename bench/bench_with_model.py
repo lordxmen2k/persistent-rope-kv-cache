@@ -4,14 +4,17 @@ Runs HuggingFace generation while tracking the KV cache in parallel with
 the rope. The rope acts as a 'shadow' index; we measure the rope's
 operations during real model inference.
 
-This is for the book: it produces real numbers from a real model
-(distilgpt2, ~80M params) running on CPU.
+Auto-detects CUDA and runs on GPU if available. Falls back to CPU.
 
-Run: python -m bench.bench_with_model
+Run:
+    python -m bench.bench_with_model                  # auto-detect device
+    python -m bench.bench_with_model --device cuda    # force GPU
+    python -m bench.bench_with_model --device cpu     # force CPU
 """
 import sys
 import time
 import statistics
+import argparse
 
 sys.path.insert(0, "src")
 
@@ -21,18 +24,35 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from rope import RopeBlockManager, Tier
 
 
-def main(model_name: str = "distilgpt2", max_new_tokens: int = 50, n_prompts: int = 8):
+def detect_device(forced: str = None) -> str:
+    if forced:
+        return forced
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def main(model_name: str = "distilgpt2", max_new_tokens: int = 50,
+         n_prompts: int = 8, device: str = None):
+    device = detect_device(device)
     print("=" * 60)
-    print(f"Real-model benchmark: {model_name}")
+    print(f"Real-model benchmark: {model_name} on {device.upper()}")
     print("=" * 60)
+
+    if device == "cuda":
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  CUDA: {torch.version.cuda}")
+        print(f"  GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     print(f"\nLoading {model_name}...")
     t0 = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+    model.to(device)
     model.eval()
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  loaded in {(time.perf_counter() - t0):.1f}s ({n_params/1e6:.1f}M params)")
+    t_load = time.perf_counter() - t0
+    print(f"  loaded in {t_load:.1f}s ({n_params/1e6:.1f}M params)")
 
     # Prompts of varying length
     base_prompt = "The history of artificial intelligence is a long and fascinating story. "
@@ -58,10 +78,12 @@ def main(model_name: str = "distilgpt2", max_new_tokens: int = 50, n_prompts: in
     seq_timings = []
     seq_lengths = []
 
+    if device == "cuda":
+        torch.cuda.synchronize()
     with torch.no_grad():
         for i, prompt in enumerate(prompts_with_share):
             inputs = tokenizer(prompt, return_tensors="pt")
-            input_ids = inputs["input_ids"]
+            input_ids = inputs["input_ids"].to(device)
             prompt_len = input_ids.shape[1]
 
             # Create sequence in rope block manager
@@ -71,12 +93,16 @@ def main(model_name: str = "distilgpt2", max_new_tokens: int = 50, n_prompts: in
             t_rope_setup = time.perf_counter() - t_rope_setup
 
             # Generate
+            if device == "cuda":
+                torch.cuda.synchronize()
             t_model = time.perf_counter()
             out_ids = model.generate(
                 input_ids,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
             )
+            if device == "cuda":
+                torch.cuda.synchronize()
             t_model = time.perf_counter() - t_model
             new_tokens = out_ids.shape[1] - prompt_len
 
@@ -121,9 +147,9 @@ def main(model_name: str = "distilgpt2", max_new_tokens: int = 50, n_prompts: in
     print(f"  total sequences:       {len(seq_timings)}")
     print(f"  total prompt tokens:   {total_prompt}")
     print(f"  total new tokens:      {total_new}")
-    print(f"  total model time:      {total_model_t:.2f}s")
+    print(f"  total model time:      {total_model_t:.3f}s")
     print(f"  total rope time:       {total_rope_t*1000:.2f}ms")
-    print(f"  rope / model:          {total_rope_t / total_model_t * 100:.3f}%")
+    print(f"  rope / model:          {total_rope_t / total_model_t * 100:.4f}%")
     print(f"  aggregate tok/s:       {total_new / total_model_t:.2f}")
 
     # Per-op rope cost
@@ -144,22 +170,35 @@ def main(model_name: str = "distilgpt2", max_new_tokens: int = 50, n_prompts: in
     print(f"  mapping size:          {s['rope_stats']['n_nodes_total']}")
     print(f"  rope length (sum):     {s['rope_stats']['length']}")
 
-    # ------------------------------------------------------------------
-    # Bracket the rope's bookkeeping against model cost
-    # ------------------------------------------------------------------
     print(f"\n--- rope overhead analysis ---")
-    # The rope tracks N sequences. Each snapshot is O(L) for L tokens.
-    # Total tokens in rope = sum(seq lengths) = {sum(seq_lengths)}.
-    # The model's main cost is the attention compute (O(N * L^2)).
-    # The rope's per-token cost should be O(1) (constant work per token).
     print(f"  total tokens tracked by rope:  {sum(seq_lengths)}")
     print(f"  rope bookkeeping:              {total_rope_t*1000:.2f}ms")
     print(f"  rope per token:                 {total_rope_t / sum(seq_lengths) * 1e6:.2f} us")
     print(f"  model attention:                {total_model_t*1000:.1f}ms")
-    print(f"  rope as % of model cost:        {total_rope_t / total_model_t * 100:.3f}%")
+    print(f"  rope as % of model cost:        {total_rope_t / total_model_t * 100:.4f}%")
 
-    return bm, seq_timings, seq_lengths
+    return {
+        "device": device,
+        "model": model_name,
+        "n_seqs": len(seq_timings),
+        "total_prompt": total_prompt,
+        "total_new": total_new,
+        "total_model_s": total_model_t,
+        "total_rope_ms": total_rope_t * 1000,
+        "rope_pct": total_rope_t / total_model_t * 100,
+        "tok_per_sec": total_new / total_model_t,
+        "rope_per_token_us": total_rope_t / sum(seq_lengths) * 1e6,
+        "rope_per_op_setup_us": rope_per_op_setup,
+        "rope_per_op_emit_us": rope_per_op_emit,
+    }
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default=None, help="cuda or cpu (auto-detect if not set)")
+    parser.add_argument("--model", default="distilgpt2")
+    parser.add_argument("--max-new-tokens", type=int, default=50)
+    parser.add_argument("--n-prompts", type=int, default=8)
+    args = parser.parse_args()
+    main(model_name=args.model, max_new_tokens=args.max_new_tokens,
+         n_prompts=args.n_prompts, device=args.device)
