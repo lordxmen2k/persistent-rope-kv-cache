@@ -211,6 +211,132 @@ multi-threaded workload.
 
 ---
 
+## Section 4b — Related work (literature context, NOT measured on this machine)
+
+The numbers in this section are quoted from the cited papers. They are
+provided as context for the design landscape, **not as a head-to-head
+comparison**. We do not have vLLM, SGLang, or Mooncake installed on
+this Windows machine, and a fair head-to-head would require running
+the same model and workload through both systems on the same
+Linux+CUDA box. The right way to use this section is "here's what
+prior art reports; here's what we report; here's where they
+differ."
+
+### vLLM (Kwon et al., SOSP 2023 — arXiv:2309.06180)
+
+PagedAttention: KV cache partitioned into fixed-size blocks, block
+table maps logical→physical, copy-on-write for sharing, refcount
+tracking.
+
+| metric | vLLM published | our rope |
+|---|---|---|
+| KV cache memory utilization | 96.3% effective (vs 20.4% Orca) | 100% (no fragmentation by construction) |
+| throughput vs FasterTransformer (OPT-13B) | up to 22× | not measured |
+| throughput vs Orca (OPT-13B, ShareGPT) | 2.2–4.3× | not measured |
+| throughput on shared-prefix workloads | up to 3.6× | not measured; structural sharing gives O(1) fork |
+| block size | 16 (default) | 16 (matches) |
+| block-table preparation overhead | "up to 30% of decode latency" (vAttention 2024) | n/a; our snapshot is O(log n) |
+| PagedAttention kernel vs FlashAttention-2 | 20–26% slower (own paper) / 2.8× slower (vAttention 2024) | n/a |
+| PagedAttention kernel vs FlashInfer paged | up to 42% slower (vAttention 2024) | n/a |
+
+**Where our design overlaps with vLLM:** both use 16-token blocks and
+refcount-based sharing. vLLM's block table is a 2D padded tensor; our
+rope is a balanced binary tree with structural sharing.
+
+**Where we differ:** vLLM's block table preparation is a known
+bottleneck (30% of decode latency per the vAttention paper). The
+rope's snapshot is a tree walk, which is O(L) for the walk but
+amortized over the lifetime of the rope via rebalance.
+
+### SGLang RadixAttention (Zheng et al., 2024 — arXiv:2312.07104)
+
+KV cache stored in a radix tree (trie) keyed by token sequences;
+LRU eviction at node granularity; compatible with PagedAttention and
+tensor parallelism.
+
+| metric | SGLang published | our rope |
+|---|---|---|
+| throughput vs prior systems (multi-turn) | up to 6.4× | not measured |
+| throughput from RadixAttention alone (cache hit) | up to 5× | not measured |
+| data-structure overhead | <0.3% (74.3s workload, 0.2s tree mgmt) | 0.21% on GPU distilgpt2 |
+| production cache hit rate (Chatbot Arena) | 52.4% (LLaVA-Next-34B), 74.1% (other models) | not applicable to single-machine demo |
+| radix tree lookup cost | O(L) per request | O(log n) after rebalance, O(n) before |
+| multi-turn chat KV reuse | automatic | automatic via structural sharing |
+| supported eviction policies | LRU only | hot/warm/cold tiers + manual evict/promote |
+
+**Closest prior art.** The radix tree is structurally similar to our
+rope — both are trie-based KV indexes with prefix sharing. The
+differences:
+
+- SGLang's radix tree stores KV cache pages as leaves. Our rope's
+  leaves also hold KV bytes. Same shape, different node type
+  (radix trie node vs. binary internal node).
+- SGLang's eviction is LRU at the node level. Our rope has explicit
+  hot/warm/cold tiers that can be set per-token.
+- SGLang's lookup is O(L) per request (walk the trie). Our rope's
+  pre-rebalance is O(n_leaves) for arbitrary positions but O(L) for
+  append-only. After rebalance, it's O(log n_leaves) for all
+  positions.
+- SGLang is production-deployed and battle-tested; our rope is a
+  research prototype.
+
+### Mooncake (Qin et al., FAST 2025 — arXiv:2407.00079)
+
+KVCache-centric disaggregated architecture: prefill and decode on
+separate clusters, KV cache stored across GPU memory, CPU DRAM, and
+SSD. Global cache-aware scheduler. RDMA transfer engine.
+
+| metric | Mooncake published | our rope |
+|---|---|---|
+| throughput increase (simulated long-context) | up to 525% | not measured; we don't do disaggregation |
+| throughput increase (real Kimi trace) | 59–498% across workloads | not measured |
+| Kimi production: requests handled | 75–115% more than vLLM baseline | not applicable (single machine) |
+| global cache hit rate vs local | 2.36× | not applicable (single machine) |
+| prefill compute time saved | up to 48% (via cache hit) | not measured |
+| transfer engine bandwidth | 87 GB/s (4×200G RoCE), 190 GB/s (8×400G) | not applicable |
+| typical block size | 16–512 tokens (model-dependent) | 16 |
+| eviction policy | LRU | hot/warm/cold + manual |
+
+**Where Mooncake goes further:** cross-machine, cross-architecture
+disaggregation, RDMA transfer, SLO-aware admission control. None of
+this is in our rope.
+
+**Where the rope complements Mooncake:** Mooncake's KV cache
+addresses (block hashes) form a key-value store. The rope is a
+*position-keyed* persistent structure. A rope could be the local
+in-process index for a Mooncake node — that's a future-work
+direction, not a current claim.
+
+### Summary table
+
+| system | primary contribution | our comparison |
+|---|---|---|
+| vLLM | paged attention kernel + block manager | same 16-token blocks; rope is a different index structure |
+| SGLang | radix trie for KV reuse | same shape, different node type; SGLang is O(L) lookup, rope is O(log n) post-rebalance |
+| Mooncake | disaggregated cluster-wide KV pool | orthogonal; rope could be the local index for a Mooncake node |
+| rope (this work) | persistent position-keyed index with structural sharing | ships as a Python reference; Rust port is the production claim |
+
+### Honest take
+
+The rope's contribution is not "we beat vLLM" — we haven't measured
+that. It's a *different* index structure (persistent balanced binary
+tree with structural sharing) that complements the existing
+ecosystem. The published numbers above tell us:
+
+1. Block-table overhead is a real cost (vLLM, vAttention paper)
+2. Prefix sharing is a real win (vLLM 3.6×, SGLang 5×, Mooncake
+   2.36× cache hit rate)
+3. Data-structure overhead is consistently <1% across all systems
+   (SGLang 0.3%, rope 0.21% on GPU, 0.12% on CPU)
+
+The rope is in the same ballpark on overhead. Its unique angle is
+the *persistent* (immutable) structural sharing, which is what makes
+beam search and tree-of-thoughts branching O(1) instead of O(prefix
+length) — and that's a research claim that needs the Rust port to
+verify.
+
+---
+
 ## Section 5 — Headline numbers for the book
 
 If you can only quote five numbers from this report, use these:
